@@ -46,7 +46,7 @@ const config: HardhatUserConfig = {
   },
   etherscan: {
     apiKey: {
-      cc3: "ABC"
+      cc3: "7fd6bf32-1ba4-41f3-a0c4-c3f53897a89c"
     },
     customChains: [
       {

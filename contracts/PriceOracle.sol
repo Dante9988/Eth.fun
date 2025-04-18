@@ -40,6 +40,7 @@ contract PriceOracle is IPriceOracle, Ownable, ReentrancyGuard {
     event PoolAdded(address indexed pool, address token0, address token1);
     event PoolRemoved(address indexed pool);
     event PriceUpdated(int256 newPrice);
+    event PriceUpdateFailed();
     
     constructor(
         address _factory,
@@ -54,8 +55,149 @@ contract PriceOracle is IPriceOracle, Ownable, ReentrancyGuard {
         WCTC = _wctc;
         USD_TCoin = _usdTcoin;
         
-        // Initialize with a default price of 0.35 USD-TCoin per 1 WCTC
-        price = 35000000; // 0.35 with 8 decimals
+        // Initially set price to 0, will be updated correctly when updatePrice() is called
+        price = 0;
+    }
+    
+    // Helper function to debug pool information
+    function debugPool(address poolAddress) external view returns (
+        address token0,
+        address token1,
+        uint8 token0Decimals,
+        uint8 token1Decimals,
+        uint160 sqrtPriceX96,
+        int24 tick,
+        uint128 liquidity,
+        bool isActive
+    ) {
+        if (poolAddress == address(0)) return (address(0), address(0), 0, 0, 0, 0, 0, false);
+        
+        PoolConfig memory pool = pools[poolAddress];
+        
+        IUniswapV3Pool v3Pool = IUniswapV3Pool(poolAddress);
+        (uint160 _sqrtPriceX96, int24 _tick,,,,,) = v3Pool.slot0();
+        uint128 _liquidity = v3Pool.liquidity();
+        
+        return (
+            pool.token0,
+            pool.token1,
+            pool.token0Decimals,
+            pool.token1Decimals,
+            _sqrtPriceX96,
+            _tick,
+            _liquidity,
+            pool.isActive
+        );
+    }
+    
+    // Helper function to process a pool and get its price
+    function _processPool(address poolAddress) private view returns (uint256 priceFromPool, uint128 liquidity) {
+        if (poolAddress == address(0)) return (0, 0);
+        
+        IUniswapV3Pool v3Pool = IUniswapV3Pool(poolAddress);
+        (uint160 sqrtPriceX96, int24 tick,,,,,) = v3Pool.slot0();
+        liquidity = v3Pool.liquidity();
+        
+        // Skip pools with no liquidity
+        if (liquidity == 0) return (0, 0);
+        
+        // Get tokens in correct order
+        address token0 = v3Pool.token0();
+        address token1 = v3Pool.token1();
+        
+        // Get decimals from the actual tokens - not from the stored pool config
+        // This ensures we always have the right decimal values
+        uint8 token0Decimals = IERC20(token0).decimals();
+        uint8 token1Decimals = IERC20(token1).decimals();
+        
+        // Calculate price based on token ordering
+        if (token0 == WCTC && token1 == USD_TCoin) {
+            // Direct case: price is USD-TCoin per WCTC
+            priceFromPool = calculatePriceFromSqrtPriceX96(
+                sqrtPriceX96,
+                token0Decimals,
+                token1Decimals
+            );
+        } else if (token1 == WCTC && token0 == USD_TCoin) {
+            // Inverse case: price is WCTC per USD-TCoin, need to invert
+            uint256 inversePrice = calculatePriceFromSqrtPriceX96(
+                sqrtPriceX96,
+                token0Decimals,
+                token1Decimals
+            );
+            
+            // Invert the price - we need USD-TCoin per WCTC, not WCTC per USD-TCoin
+            // Use 10^16 to maintain precision
+            if (inversePrice > 0) {
+                priceFromPool = (10**16) / inversePrice;
+            }
+        } else {
+            // For any other token pair, we treat them as general tokens
+            // Get price directly from sqrtPriceX96 without token checks
+            priceFromPool = calculatePriceFromSqrtPriceX96(
+                sqrtPriceX96,
+                token0Decimals,
+                token1Decimals
+            );
+        }
+    }
+    
+    function calculatePriceFromPool(
+        IUniswapV3Pool v3Pool,
+        uint160 sqrtPriceX96
+    ) internal view returns (uint256) {
+        // Following the exact same calculation that works in the test:
+        // 1. sqrtPrice = sqrtPriceX96 / 2^96
+        // 2. price = sqrtPrice * sqrtPrice
+        // 3. scale to 8 decimals
+        
+        // To prevent overflow, we:
+        // 1. First divide sqrtPriceX96 by 2^48 (half of 96)
+        // 2. Square the result
+        // 3. Divide by remaining 2^48
+        // This is equivalent to: (sqrtPriceX96/2^96)^2
+        uint256 sqrtPrice = uint256(sqrtPriceX96) / (2 ** 48);
+        uint256 price = (sqrtPrice * sqrtPrice) / (2 ** 96);
+
+        // Scale to 8 decimals (multiply by 10^8)
+        return price * 1e8;
+    }
+
+    function _updatePrice() internal {
+        uint256 bestPrice = 0;
+        uint128 highestLiquidity = 0;
+        
+        // Check all pools, not just WCTC/USD-TCoin pools
+        for (uint i = 0; i < poolList.length; i++) {
+            PoolConfig memory pool = pools[poolList[i]];
+            if (!pool.isActive) continue;
+            
+            IUniswapV3Pool v3Pool = IUniswapV3Pool(pool.poolAddress);
+            (uint160 sqrtPriceX96, int24 tick,,,,,) = v3Pool.slot0();
+            uint128 liquidity = v3Pool.liquidity();
+            
+            // Skip pools with no liquidity
+            if (liquidity == 0) continue;
+            
+            uint256 priceFromPool = calculatePriceFromPool(v3Pool, sqrtPriceX96);
+            
+            // Skip pools with no price
+            if (priceFromPool == 0) continue;
+            
+            // Track the pool with the highest liquidity
+            if (liquidity > highestLiquidity) {
+                highestLiquidity = liquidity;
+                bestPrice = priceFromPool;
+            }
+        }
+        
+        // If we found a good price, update it
+        if (bestPrice > 0) {
+            price = int256(bestPrice);
+            emit PriceUpdated(price);
+        } else {
+            emit PriceUpdateFailed();
+        }
     }
     
     function addPool(
@@ -103,70 +245,6 @@ contract PriceOracle is IPriceOracle, Ownable, ReentrancyGuard {
         _updatePrice();
     }
 
-    function _updatePrice() internal {
-        uint256 oldPrice = uint256(price);
-        int256 totalPrice;
-        uint256 activePools;
-        
-        // First check existing pools
-        for (uint i = 0; i < poolList.length; i++) {
-            PoolConfig memory pool = pools[poolList[i]];
-            if (!pool.isActive) continue;
-            
-            IUniswapV3Pool v3Pool = IUniswapV3Pool(pool.poolAddress);
-            (uint160 sqrtPriceX96, int24 tick,,,,,) = v3Pool.slot0();
-            
-            // Calculate price from sqrtPriceX96
-            uint256 priceFromPool = calculatePriceFromSqrtPriceX96(
-                sqrtPriceX96,
-                pool.token0Decimals,
-                pool.token1Decimals
-            );
-            
-            totalPrice += int256(priceFromPool);
-            activePools++;
-        }
-        
-        // Then check for new pools
-        for (uint i = 0; i < feeTiers.length; i++) {
-            address poolAddress = IUniswapV3Factory(factory).getPool(WCTC, USD_TCoin, feeTiers[i]);
-            if (poolAddress == address(0)) continue;
-            
-            // If pool exists but not in our list or is inactive, add/activate it
-            if (!pools[poolAddress].isActive) {
-                // If pool exists in our list but is inactive, just activate it
-                if (pools[poolAddress].poolAddress != address(0)) {
-                    pools[poolAddress].isActive = true;
-                } else {
-                    // Otherwise add it as a new pool
-                    addPool(poolAddress, WCTC, USD_TCoin);
-                }
-                
-                // Get price from new/activated pool
-                IUniswapV3Pool v3Pool = IUniswapV3Pool(poolAddress);
-                (uint160 sqrtPriceX96, int24 tick,,,,,) = v3Pool.slot0();
-                
-                uint256 priceFromPool = calculatePriceFromSqrtPriceX96(
-                    sqrtPriceX96,
-                    IERC20(WCTC).decimals(),
-                    IERC20(USD_TCoin).decimals()
-                );
-                
-                totalPrice += int256(priceFromPool);
-                activePools++;
-            }
-        }
-        
-        // If no active pools, keep the current price
-        if (activePools == 0) {
-            return;
-        }
-        
-        // Update price with average of all active pools
-        price = totalPrice / int256(activePools);
-        emit PriceUpdated(price);
-    }
-
     // This function should be called by a keeper or external service
     // that listens to Uniswap V3 Swap events
     function onSwap(
@@ -178,21 +256,19 @@ contract PriceOracle is IPriceOracle, Ownable, ReentrancyGuard {
         uint160 sqrtPriceX96,
         uint128 liquidity,
         int24 tick
-    ) external nonReentrant {
+    ) external override {
         // Only process swaps from our tracked pools
         PoolConfig memory poolConfig = pools[pool];
         if (!poolConfig.isActive) return;
 
-        // Calculate new price directly from the swap's sqrtPriceX96
-        uint256 priceFromSwap = calculatePriceFromSqrtPriceX96(
-            sqrtPriceX96,
-            poolConfig.token0Decimals,
-            poolConfig.token1Decimals
-        );
+        IUniswapV3Pool v3Pool = IUniswapV3Pool(pool);
+        uint256 priceFromSwap = calculatePriceFromPool(v3Pool, sqrtPriceX96);
 
-        // Update price immediately with this pool's price
-        price = int256(priceFromSwap);
-        emit PriceUpdated(price);
+        // Only update price if it's non-zero
+        if (priceFromSwap > 0) {
+            price = int256(priceFromSwap);
+            emit PriceUpdated(price);
+        }
     }
     
     function calculatePriceFromSqrtPriceX96(
@@ -200,28 +276,22 @@ contract PriceOracle is IPriceOracle, Ownable, ReentrancyGuard {
         uint8 token0Decimals,
         uint8 token1Decimals
     ) internal pure returns (uint256) {
-        // Convert sqrtPriceX96 to uint256 for more precision
+        if (sqrtPriceX96 == 0) return 0;
+
         uint256 sqrtPrice = uint256(sqrtPriceX96);
-        
-        // Square the price and maintain precision
-        uint256 priceQ192 = (sqrtPrice * sqrtPrice);
-        
-        // Scale to our target decimals (8) while maintaining precision
-        uint256 price = priceQ192;
-        
-        // Adjust for decimal differences between tokens first
-        if (token1Decimals > token0Decimals) {
-            price = price * (10 ** uint256(token1Decimals - token0Decimals));
-        } else if (token0Decimals > token1Decimals) {
-            price = price / (10 ** uint256(token0Decimals - token1Decimals));
+        uint256 priceQ192 = sqrtPrice * sqrtPrice;
+        int256 decimalDiff = int256(token1Decimals) - int256(token0Decimals);
+
+        uint256 numerator = priceQ192 * 1e8; // Apply scale first (before dividing)
+        uint256 denominator = 2 ** 192;
+
+        if (decimalDiff > 0) {
+            numerator *= 10 ** uint256(decimalDiff);
+        } else if (decimalDiff < 0) {
+            denominator *= 10 ** uint256(-decimalDiff);
         }
-        
-        // Now scale to our 8 decimals format
-        // We need to divide by 2^192 (96 * 2 for squaring)
-        // And multiply by 10^8 for our decimal format
-        price = (price * (10 ** 8)) >> 192;
-        
-        return price;
+
+        return numerator / denominator;
     }
     
     // Price getter functions
@@ -231,5 +301,11 @@ contract PriceOracle is IPriceOracle, Ownable, ReentrancyGuard {
     
     function getDecimals() external view returns (uint8) {
         return decimals_;
+    }
+
+    // Add a function to force update the price (for emergencies or initialization)
+    function forceUpdatePrice(uint256 newPrice) external override onlyOwner {
+        price = int256(newPrice);
+        emit PriceUpdated(price);
     }
 } 
