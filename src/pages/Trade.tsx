@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
-import { useSelector, useDispatch } from 'react-redux';
+import { useDispatch } from 'react-redux';
 import {
   Box,
   Container,
@@ -18,26 +18,30 @@ import {
 import { ethers } from 'ethers';
 import useContracts from '../hooks/useContracts';
 import useWallet from '../hooks/useWallet';
-import { RootState } from '../store';
 import { config } from '../config';
-import { setTokenInfo } from '../store/slices/tokenInfoSlice';
+
+interface TokenData {
+  address: string;
+  symbol: string;
+  name: string;
+  price: string;
+  priceUSD: string;
+  marketCap: string;
+  bondingProgress: number;
+}
 
 const BONDING_CURVE_THRESHOLD = ethers.utils.parseUnits('85000', 8); // 85k USD with 8 decimals
 
 const Trade = () => {
   const { address } = useParams<{ address: string }>();
-  const dispatch = useDispatch();
   const { buyToken, sellToken, getTokenPrice } = useContracts();
   const { isConnected, chainId } = useWallet();
   const [amount, setAmount] = useState('');
   const [transactionLoading, setTransactionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true); // Start with loading true
-  const [localTokenInfo, setLocalTokenInfo] = useState<any>(null);
-
-  const { tokens } = useSelector((state: RootState) => state.tokenInfo);
-  const tokenInfo = address ? (localTokenInfo || tokens[address]) : null;
+  const [loading, setLoading] = useState(true);
+  const [tokenInfo, setTokenInfo] = useState<TokenData | null>(null);
 
   const calculateBondingProgress = (marketCapUSD: ethers.BigNumber): number => {
     if (marketCapUSD.isZero()) return 0;
@@ -46,13 +50,13 @@ const Trade = () => {
   };
 
   const fetchTokenInfo = useCallback(async () => {
-    if (!address || !chainId || !isConnected) {
-      console.log('Missing requirements:', { address, chainId, isConnected });
-      return;
-    }
-    
+    console.log('TRADE: fetchTokenInfo called', { address, chainId, isConnected });
     try {
-      console.log('Fetching token info in Trade.tsx for address:', address);
+      if (!chainId || !address) {
+        console.log('TRADE: fetchTokenInfo - missing chainId or address');
+        return;
+      }
+
       setLoading(true);
       const chainConfig = config[chainId.toString() as keyof typeof config];
       if (!chainConfig) {
@@ -75,8 +79,8 @@ const Trade = () => {
         ['function getMarketCapInUSD(address) view returns (uint256)'],
         provider
       );
-
-      console.log('Fetching token data...');
+      
+      console.log('TRADE: Fetching token data from contracts...');
       const [symbol, name, priceInWCTC, marketCapInUSD] = await Promise.all([
         contract.symbol(),
         contract.name(),
@@ -88,12 +92,12 @@ const Trade = () => {
       const WCTC_PRICE_USD = 2000;
       const priceInUSD = parseFloat(priceInWCTC) * WCTC_PRICE_USD;
 
-      console.log('Raw market cap Trade.tsx:', marketCapInUSD.toString());
+      console.log('TRADE: Raw market cap:', marketCapInUSD.toString());
       
       // Market cap comes in with 8 decimals from the contract
       const marketCapUSDFormatted = parseFloat(ethers.utils.formatUnits(marketCapInUSD, 8));
 
-      console.log('Token Info in Trade.tsx:', {
+      console.log('TRADE: Calculated token info:', {
         symbol,
         priceInWCTC,
         priceInUSD,
@@ -101,62 +105,42 @@ const Trade = () => {
         marketCapUSDFormatted
       });
 
-      const bondingProgress = calculateBondingProgress(marketCapInUSD);
-
+      // For testing, hardcode the values
       const newTokenInfo = {
         address,
         symbol,
         name,
-        price: parseFloat(priceInWCTC).toFixed(8),
-        priceUSD: priceInUSD.toFixed(4),
-        marketCap: marketCapUSDFormatted.toLocaleString(undefined, {
-          minimumFractionDigits: 2,
-          maximumFractionDigits: 2
-        }),
-        bondingProgress
+        price: "0.00000001", // Hardcoded for testing
+        priceUSD: "0.00000020", // Hardcoded for testing
+        marketCap: "222,222,222,220,000.00", // Hardcoded for testing
+        bondingProgress: calculateBondingProgress(marketCapInUSD)
       };
 
-      setLocalTokenInfo(newTokenInfo);
-      dispatch(setTokenInfo({
-        address,
-        info: newTokenInfo
-      }));
+      console.log('TRADE: Setting local token info:', newTokenInfo);
+      setTokenInfo(newTokenInfo);
     } catch (error) {
-      console.error('Error fetching token info in Trade.tsx:', error);
+      console.error('TRADE: Error fetching token info:', error);
       setError('Failed to fetch token information');
     } finally {
       setLoading(false);
     }
-  }, [address, chainId, isConnected, dispatch, getTokenPrice]);
+  }, [address, chainId, getTokenPrice]);
 
-  // Initial fetch on mount and when dependencies change
   useEffect(() => {
-    const init = async () => {
-      console.log('Trade.tsx mounted/updated', { address, chainId, isConnected });
-      if (address && chainId && isConnected) {
-        await fetchTokenInfo();
-      }
-    };
-    init();
-  }, [address, chainId, isConnected, fetchTokenInfo]);
-
-  // Set up polling
-  useEffect(() => {
-    if (!address || !chainId || !isConnected) return;
-
-    console.log('Setting up polling interval in Trade.tsx');
-    fetchTokenInfo(); // Immediate fetch when setting up polling
-
-    const interval = setInterval(() => {
-      console.log('Polling update in Trade.tsx');
+    console.log('TRADE: useEffect for fetching triggered', { isConnected, address });
+    if (isConnected && address) {
+      console.log('TRADE: Starting initial fetch and interval');
       fetchTokenInfo();
-    }, 5000);
-
-    return () => {
-      console.log('Cleaning up polling interval in Trade.tsx');
-      clearInterval(interval);
-    };
-  }, [address, chainId, isConnected, fetchTokenInfo]);
+      const interval = setInterval(() => {
+        console.log('TRADE: Interval fetch triggered');
+        fetchTokenInfo();
+      }, 5000);
+      return () => {
+        console.log('TRADE: Cleaning up interval');
+        clearInterval(interval);
+      };
+    }
+  }, [isConnected, address, fetchTokenInfo]);
 
   const handleBuy = async () => {
     if (!isConnected) {
@@ -182,9 +166,9 @@ const Trade = () => {
       const result = await buyToken(address, amount);
       if (result.success) {
         setTxHash(result.txHash);
-        setAmount(''); // Clear input
-        console.log('Buy successful, fetching updated token info');
-        await fetchTokenInfo(); // Refresh token info after successful transaction
+        setAmount('');
+        console.log('TRADE: Buy successful, fetching updated token info');
+        await fetchTokenInfo();
       } else {
         setError('Transaction failed');
       }
@@ -220,9 +204,9 @@ const Trade = () => {
       const result = await sellToken(address, amount);
       if (result.success) {
         setTxHash(result.txHash);
-        setAmount(''); // Clear input
-        console.log('Sell successful, fetching updated token info');
-        await fetchTokenInfo(); // Refresh token info after successful transaction
+        setAmount('');
+        console.log('TRADE: Sell successful, fetching updated token info');
+        await fetchTokenInfo();
       } else {
         setError('Transaction failed');
       }
@@ -235,6 +219,7 @@ const Trade = () => {
   };
 
   if (loading || !tokenInfo) {
+    console.log('TRADE: Rendering loading state', { loading, tokenInfo });
     return (
       <Container>
         <Box display="flex" justifyContent="center" alignItems="center" minHeight="80vh">
@@ -244,6 +229,7 @@ const Trade = () => {
     );
   }
 
+  console.log('TRADE: Rendering with tokenInfo:', tokenInfo);
   return (
     <Container maxWidth="lg">
       <Box py={4}>

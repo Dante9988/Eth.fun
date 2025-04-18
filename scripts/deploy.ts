@@ -6,6 +6,7 @@ import { Contract, Signer } from 'ethers';
 import { IERC20 } from '../typechain-types/contracts/Token.sol/IERC20';
 import { Token__factory } from '../typechain-types';
 import DeployedContracts from './interfaces';
+import fs from 'fs';
 
 let accounts: any;
 let deployer: HardhatEthersSigner;
@@ -67,7 +68,6 @@ const deploy = async () => {
 
     // Write contract addresses to a file
     // Get the network information
-    const fs = require('fs');
     const network = await ethers.provider.getNetwork();
     const chainId = network.chainId.toString();
 
@@ -186,6 +186,50 @@ const deploy = async () => {
         K: poolAfter.K.toString(),
         zeroPriceActive: poolAfter.zeroPriceActive
     });
+
+    // Deploy PriceOracle
+    const PriceOracle = await ethers.getContractFactory("PriceOracle");
+    const priceOracle = await PriceOracle.deploy(
+        uniswapV3.V3Factory.address,
+        uniswapV3.WETH9.address,
+        tokenAddress,
+        { from: deployer.address }
+    );
+    await priceOracle.deployed();
+    console.log("PriceOracle deployed to:", priceOracle.address);
+
+    // Deploy ETHPriceStorage
+    const ETHPriceStorage = await ethers.getContractFactory("ETHPriceStorage");
+    const ethPriceStorage = await ETHPriceStorage.deploy(
+        priceOracle.address,
+        { from: deployer.address }
+    );
+    await ethPriceStorage.deployed();
+    console.log("ETHPriceStorage deployed to:", ethPriceStorage.address);
+
+    // Deploy PumpFunEvm
+    const PumpFunEvm = await ethers.getContractFactory("PumpFunEvm");
+    const pumpFunEvm = await PumpFunEvm.deploy(
+        uniswapV3.V3Factory.address,
+        uniswapV3.NFTManager.address,
+        uniswapV3.SwapRouter.address,
+        uniswapV3.WETH9.address,
+        multiAMM.address,
+        ethPriceStorage.address
+    );
+    await pumpFunEvm.deployed();
+    console.log("PumpFunEvm deployed to:", pumpFunEvm.address);
+
+    // Save contract addresses
+    const addresses = {
+        priceOracle: priceOracle.address,
+        ethPriceStorage: ethPriceStorage.address,
+        multiAMM: multiAMM.address,
+        pumpFunEvm: pumpFunEvm.address
+    };
+
+    fs.writeFileSync('contractAddresses.json', JSON.stringify(addresses, null, 2));
+    console.log("Contract addresses saved to contractAddresses.json");
 }
 
 deploy()

@@ -11,7 +11,7 @@ import "../interfaces/IMultiAMM.sol";
 import "../libs/PriceLib.sol"; 
 import "../interfaces/ILiquidityManager.sol";
 import "hardhat/console.sol";
-import "../MockPriceFeed.sol";
+import "../ETHPriceStorage.sol";
 import "../SqrtPriceCalculator.sol";
 import "./CollectFeesManager.sol";
 
@@ -23,7 +23,7 @@ abstract contract LiquidityManager is ILiquidityManager, SqrtPriceCalculator, Co
     IMultiAMM public immutable amm;
     address public immutable WETH9;
     mapping(address => bool) public whitelisted;
-    MockPriceFeed public ethUsdPriceFeed;
+    ETHPriceStorage public ethPriceStorage;
     uint256 public constant MARKET_CAP_THRESHOLD = 85_000 * 1e8;
 
     modifier onlyWhitelisted() {
@@ -38,7 +38,7 @@ abstract contract LiquidityManager is ILiquidityManager, SqrtPriceCalculator, Co
         address _weth9,
         address _amm,
         address _ico,
-        address _ethUsdPriceFeed
+        address _ethPriceStorage
     ) CollectFeesManager(_nonfungiblePositionManager, msg.sender) {
         factory = IUniswapV3Factory(_factory);
         nonfungiblePositionManager = INonfungiblePositionManager(_nonfungiblePositionManager);
@@ -47,7 +47,7 @@ abstract contract LiquidityManager is ILiquidityManager, SqrtPriceCalculator, Co
         amm = IMultiAMM(_amm);
         whitelisted[owner] = true;
         whitelisted[_ico] = true;
-        ethUsdPriceFeed = MockPriceFeed(_ethUsdPriceFeed);
+        ethPriceStorage = ETHPriceStorage(_ethPriceStorage);
     }
 
     function getOwnerShares(address tokenAddress) external view override returns (uint256, uint256) {
@@ -209,22 +209,16 @@ abstract contract LiquidityManager is ILiquidityManager, SqrtPriceCalculator, Co
     }
 
     function getTokenPriceInUSD(address tokenAddress) public view returns (uint256) {
-        return PriceLib.getTokenPriceInUSD(
-            tokenAddress,
-            WETH9,
-            amm,
-            AggregatorV3Interface(ethUsdPriceFeed)
-        );
+        uint256 ethPrice = ethPriceStorage.getPrice();
+        (uint256 priceInWETH, ) = amm.getTokenPrice(tokenAddress, WETH9);
+        return (priceInWETH * ethPrice) / 10**8; // Adjust for decimals
     }
 
     function getMarketCapInUSD(address tokenAddress) public view returns (uint256 marketCapInUSD) {
-        marketCapInUSD = PriceLib.getMarketCapInUSD(
-            tokenAddress,
-            WETH9,
-            amm,
-            AggregatorV3Interface(ethUsdPriceFeed)
-        );
-        return marketCapInUSD;
+        uint256 ethPrice = ethPriceStorage.getPrice();
+        (uint256 priceInWETH, ) = amm.getTokenPrice(tokenAddress, WETH9);
+        uint256 totalSupply = IERC20(tokenAddress).totalSupply();
+        return (totalSupply * priceInWETH * ethPrice) / 10**26; // Adjust for decimals
     }
 
     function withdrawFees(address token0, address token1) external onlyWhitelisted {
